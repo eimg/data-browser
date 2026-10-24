@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "start": "npm run dev",
     "dev": "concurrently -n web,api -c cyan,magenta \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"npm run dev:api\"",
     "dev:web": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "dev:api": "tsx watch server/index.ts",
@@ -14,6 +15,7 @@
   "dependencies": {
     "better-sqlite3": "^13.0.3",
     "drizzle-orm": "^0.45.4",
+    "lucide-react": "^1.61.0",
     "mysql2": "^3.24.6",
     "pg": "^8.23.1",
     "react": "^19.3.1",

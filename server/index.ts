@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { ConnectionError, validateConnection } from '../src/shared/connection';
-import { closeSession, openSession, readSession } from './sessions';
+import { ConnectionError, validateConnection, type Engine } from '../src/shared/connection';
+import { beginJob, cancelJob, finishJob } from './jobs';
+import { runOperation } from './operations';
+import { closeEngine, connectionFor, listConnections, openEngine } from './sessions';
 
 const host = '127.0.0.1';
 const port = 3001;
@@ -35,7 +37,7 @@ function sessionId(req: IncomingMessage): string | undefined {
   return undefined;
 }
 
-function readBody(req: IncomingMessage): Promise<unknown> {
+function readBody(req: IncomingMessage, limit = 8_192): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -47,7 +49,7 @@ function readBody(req: IncomingMessage): Promise<unknown> {
     };
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > 8_192) {
+      if (size > limit) {
         fail(new ConnectionError('Request is too large', 413));
         req.destroy();
         return;
@@ -82,37 +84,63 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       send(res, 200, { ok: true });
       return;
     }
-    if (url.pathname !== '/api/session') {
-      send(res, 404, { error: 'Not found' });
+    if (url.pathname === '/api/session') {
+      await handleSession(req, res);
       return;
     }
-    if (req.method === 'GET') {
-      const session = readSession(sessionId(req));
-      if (!session) {
-        send(res, 401, { error: 'Not connected' });
-        return;
+    if (url.pathname === '/api/data' && req.method === 'POST') {
+      const body = await readBody(req, 2 * 1024 * 1024);
+      const record = body && typeof body === 'object' ? body as { id?: unknown; request?: unknown } : {};
+      const id = typeof record.id === 'string' ? record.id : '';
+      const request = record.request && typeof record.request === 'object' ? record.request as Record<string, unknown> : null;
+      if (!id || !request) throw new ConnectionError('Database request is incomplete.');
+      const engine = request.driver;
+      if (engine !== 'postgres' && engine !== 'mysql' && engine !== 'sqlite') throw new ConnectionError('Choose PostgreSQL, MySQL, or SQLite');
+      const controller = new AbortController();
+      beginJob(id, () => controller.abort());
+      try {
+        send(res, 200, await runOperation(connectionFor(sessionId(req), engine), request, controller.signal));
+      } finally {
+        finishJob(id);
       }
-      send(res, 200, session);
       return;
     }
-    if (req.method === 'DELETE') {
-      await closeSession(sessionId(req));
-      send(res, 200, { ok: true }, { 'set-cookie': clearCookie() });
+    if (url.pathname === '/api/data/cancel' && req.method === 'POST') {
+      const body = await readBody(req);
+      const id = body && typeof body === 'object' && 'id' in body && typeof body.id === 'string' ? body.id : '';
+      if (id) cancelJob(id);
+      send(res, 200, { ok: true });
       return;
     }
-    if (req.method === 'POST') {
-      await closeSession(sessionId(req));
-      const session = await openSession(validateConnection(await readBody(req)));
-      send(res, 201, { engine: session.engine, database: session.database, version: session.version }, { 'set-cookie': sessionCookie(session.id) });
-      return;
-    }
-    send(res, 405, { error: 'Method not allowed' }, { allow: 'GET, POST, DELETE' });
+    send(res, 404, { error: 'Not found' });
   } catch (error) {
     const status = error instanceof ConnectionError ? error.status : 500;
     const message = error instanceof ConnectionError ? error.message : 'Could not complete that request';
     if (!(error instanceof ConnectionError)) console.error(error instanceof Error ? error.message : 'Request failed');
     if (!res.headersSent) send(res, status, { error: message });
   }
+}
+
+async function handleSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const id = sessionId(req);
+  if (req.method === 'GET') {
+    send(res, 200, { connections: listConnections(id) });
+    return;
+  }
+  if (req.method === 'DELETE') {
+    const engine = new URL(req.url ?? '/', `http://${host}`).searchParams.get('engine');
+    const selected = engine === 'postgres' || engine === 'mysql' || engine === 'sqlite' ? engine as Engine : undefined;
+    if (engine && !selected) throw new ConnectionError('Choose PostgreSQL, MySQL, or SQLite');
+    await closeEngine(id, selected);
+    send(res, 200, { ok: true }, selected ? {} : { 'set-cookie': clearCookie() });
+    return;
+  }
+  if (req.method === 'POST') {
+    const opened = await openEngine(id, validateConnection(await readBody(req)));
+    send(res, 201, opened.info, { 'set-cookie': sessionCookie(opened.id) });
+    return;
+  }
+  send(res, 405, { error: 'Method not allowed' }, { allow: 'GET, POST, DELETE' });
 }
 
 server.listen(port, host, () => {

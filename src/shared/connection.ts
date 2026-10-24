@@ -35,6 +35,47 @@ export class ConnectionError extends Error {
   }
 }
 
+export const connectionLostMessage = 'The connection was lost. You can reconnect.';
+
+export class LostConnection extends Error {
+  constructor() {
+    super(connectionLostMessage);
+    this.name = 'LostConnection';
+  }
+}
+
+const sqlitePathProblem = /database file was not found|database path must be a file|unable to open database file|SQLITE_CANTOPEN|SQLITE_NOTADB|file is not a database/i;
+const apiUnreachable = /failed to fetch|fetch failed|network error|127\.0\.0\.1:3001/i;
+const sessionMissing = /Connect to a database first/;
+const serverConnectionLost = /ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|EPIPE|PROTOCOL_CONNECTION_LOST|Can't connect to (?:MySQL|the )server|connection terminated|connection ended unexpectedly|connection lost|closed the connection|connection (?:is|was|has been) closed|server has gone away|lost connection|terminating connection|admin shutdown|server shutdown|database system is (?:shutting down|starting up)/i;
+
+function errorDetail(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current != null && depth < 4; depth += 1) {
+    if (current instanceof Error) {
+      parts.push(current.message);
+      current = current.cause;
+    } else {
+      parts.push(String(current));
+      break;
+    }
+  }
+  return parts.join(' ');
+}
+
+// SQLite file and path problems stay on the path form. Drop SQLite only when
+// its session is gone or the local API can no longer be reached.
+export function isConnectionLost(error: unknown, engine?: Engine): boolean {
+  if (error instanceof LostConnection) return true;
+  const message = errorDetail(error);
+  if (message === connectionLostMessage) return true;
+  if (sqlitePathProblem.test(message)) return false;
+  if (sessionMissing.test(message) || apiUnreachable.test(message)) return true;
+  if (engine === 'sqlite') return false;
+  return serverConnectionLost.test(message);
+}
+
 const engineLabels: Record<Engine, string> = {
   postgres: 'PostgreSQL',
   mysql: 'MySQL',
@@ -76,7 +117,13 @@ export function validateConnection(input: unknown): ConnectionInput {
     port,
     user: text(body.user, 'User'),
     password: typeof body.password === 'string' ? body.password : '',
-    database: text(body.database, 'Database'),
+    database: optionalDatabase(body.database),
     ssl: body.ssl,
   };
+}
+
+function optionalDatabase(value: unknown): string {
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value !== 'string') throw new ConnectionError('Database must be text');
+  return value.trim();
 }
